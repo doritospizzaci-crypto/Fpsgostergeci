@@ -1,0 +1,658 @@
+name: APK Derle
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
+      - name: Proje dosyalarini olustur
+        run: |
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.oyunhud"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.oyunhud"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <application
+                  android:label="@string/app_name"
+                  android:icon="@android:drawable/ic_menu_info_details"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".HudService"
+                      android:exported="false"
+                      android:foregroundServiceType="specialUse">
+                      <property
+                          android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                          android:value="overlay_hud" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/oyunhud
+          cat > app/src/main/java/com/oyunhud/HudService.kt <<'EOF'
+          package com.oyunhud
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.app.Service
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import android.content.pm.ServiceInfo
+          import android.graphics.PixelFormat
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.Icon
+          import android.hardware.display.DisplayManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.provider.Settings
+          import android.text.SpannableStringBuilder
+          import android.text.Spanned
+          import android.text.style.ForegroundColorSpan
+          import android.text.style.RelativeSizeSpan
+          import android.text.style.StyleSpan
+          import android.view.Choreographer
+          import android.view.Display
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.WindowManager
+          import android.widget.LinearLayout
+          import android.widget.TextView
+          import java.net.InetSocketAddress
+          import java.net.Socket
+          import java.util.concurrent.TimeUnit
+          import kotlin.math.abs
+
+          class HudService : Service() {
+
+              companion object {
+                  @Volatile var running = false
+                  const val CH = "hud"
+              }
+
+              private val cGreen = 0xFF22C55E.toInt()
+              private val cYellow = 0xFFFACC15.toInt()
+              private val cOrange = 0xFFFB923C.toInt()
+              private val cRed = 0xFFEF4444.toInt()
+              private val cMuted = 0xFF9AA3B5.toInt()
+
+              private val h = Handler(Looper.getMainLooper())
+              private lateinit var wm: WindowManager
+              private var hud: LinearLayout? = null
+              private var tvFps: TextView? = null
+              private var tvPing: TextView? = null
+              private val sp get() = getSharedPreferences("hud", MODE_PRIVATE)
+
+              @Volatile private var pingGen = 0
+              private var frameActive = false
+              private var frames = 0
+              private var winStart = 0L
+              private val fpsHist = ArrayDeque<Int>()
+              private val results = ArrayDeque<Double?>()
+
+              private val rebuild = Runnable {
+                  if (running) { stopMeasure(); buildHud(); startMeasure() }
+              }
+              private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+                  if (key != "hx" && key != "hy") {
+                      h.removeCallbacks(rebuild)
+                      h.postDelayed(rebuild, 300)
+                  }
+              }
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  wm = getSystemService(WINDOW_SERVICE) as WindowManager
+                  sp.registerOnSharedPreferenceChangeListener(prefListener)
+              }
+
+              override fun onStartCommand(i: Intent?, flags: Int, startId: Int): Int {
+                  if (i?.action == "STOP") { stopSelf(); return START_NOT_STICKY }
+                  startFg()
+                  if (!Settings.canDrawOverlays(this)) { stopSelf(); return START_NOT_STICKY }
+                  if (hud == null) {
+                      buildHud()
+                      startMeasure()
+                  }
+                  running = true
+                  return START_STICKY
+              }
+
+              override fun onDestroy() {
+                  running = false
+                  pingGen++
+                  stopMeasure()
+                  h.removeCallbacksAndMessages(null)
+                  sp.unregisterOnSharedPreferenceChangeListener(prefListener)
+                  hud?.let { runCatching { wm.removeView(it) } }
+                  hud = null
+                  super.onDestroy()
+              }
+
+              // ---------- bildirim ----------
+              private fun startFg() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(NotificationChannel(CH, "HUD", NotificationManager.IMPORTANCE_LOW))
+                  val fl = PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                  val stopPi = PendingIntent.getService(this, 0, Intent(this, HudService::class.java).setAction("STOP"), fl)
+                  val openPi = PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java), fl)
+                  val n = Notification.Builder(this, CH)
+                      .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                      .setContentTitle("Oyun HUD çalışıyor")
+                      .setContentText("FPS ve ping ekranda gösteriliyor")
+                      .setOngoing(true)
+                      .setContentIntent(openPi)
+                      .addAction(
+                          Notification.Action.Builder(
+                              Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel), "Durdur", stopPi
+                          ).build()
+                      )
+                      .build()
+                  if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+                  else startForeground(1, n)
+              }
+
+              // ---------- HUD ----------
+              private fun line(label: String, value: String, vc: Int, extra: String): CharSequence {
+                  val sb = SpannableStringBuilder()
+                  val ex = Spanned.SPAN_EXCLUSIVE_EXCLUSIVE
+                  var a = sb.length
+                  sb.append(label)
+                  sb.setSpan(ForegroundColorSpan(cMuted), a, sb.length, ex)
+                  sb.append(" ")
+                  a = sb.length
+                  sb.append(value)
+                  sb.setSpan(ForegroundColorSpan(vc), a, sb.length, ex)
+                  sb.setSpan(StyleSpan(Typeface.BOLD), a, sb.length, ex)
+                  sb.setSpan(RelativeSizeSpan(1.25f), a, sb.length, ex)
+                  if (extra.isNotEmpty()) {
+                      sb.append("  ")
+                      a = sb.length
+                      sb.append(extra)
+                      sb.setSpan(ForegroundColorSpan(cMuted), a, sb.length, ex)
+                      sb.setSpan(RelativeSizeSpan(0.8f), a, sb.length, ex)
+                  }
+                  return sb
+              }
+
+              private fun buildHud() {
+                  hud?.let { runCatching { wm.removeView(it) } }
+                  val size = sp.getInt("textSize", 13).coerceIn(8, 30).toFloat()
+                  val opacity = sp.getInt("opacity", 70).coerceIn(10, 100)
+                  val locked = sp.getBoolean("locked", false)
+                  val showPing = sp.getBoolean("showPing", true)
+                  val showFps = sp.getBoolean("showFps", true) || !showPing
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = GradientDrawable().apply {
+                          setColor(((opacity * 255 / 100) shl 24) or 0x0B0D12)
+                          cornerRadius = dp(10).toFloat()
+                      }
+                      setPadding(dp(10), dp(6), dp(10), dp(6))
+                  }
+                  fun tv() = TextView(this).apply {
+                      textSize = size; typeface = Typeface.MONOSPACE; setTextColor(Color_WHITE)
+                  }
+                  tvFps = tv().also { it.text = line("FPS", "…", cMuted, ""); it.visibility = if (showFps) View.VISIBLE else View.GONE }
+                  tvPing = tv().also { it.text = line("PING", "…", cMuted, ""); it.visibility = if (showPing) View.VISIBLE else View.GONE }
+                  root.addView(tvFps)
+                  root.addView(tvPing)
+
+                  val p = WindowManager.LayoutParams(
+                      WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                          (if (locked) WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE else 0),
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.START
+                      x = sp.getInt("hx", dp(12)); y = sp.getInt("hy", dp(40))
+                  }
+                  var ox = 0f
+                  var oy = 0f
+                  root.setOnTouchListener { _, e ->
+                      when (e.actionMasked) {
+                          MotionEvent.ACTION_DOWN -> { ox = e.rawX - p.x; oy = e.rawY - p.y }
+                          MotionEvent.ACTION_MOVE -> {
+                              p.x = (e.rawX - ox).toInt(); p.y = (e.rawY - oy).toInt()
+                              wm.updateViewLayout(root, p)
+                          }
+                          MotionEvent.ACTION_UP -> sp.edit().putInt("hx", p.x).putInt("hy", p.y).apply()
+                      }
+                      true
+                  }
+                  wm.addView(root, p)
+                  hud = root
+              }
+
+              private val Color_WHITE = 0xFFFFFFFF.toInt()
+
+              // ---------- ölçüm ----------
+              private fun startMeasure() {
+                  val showPing = sp.getBoolean("showPing", true)
+                  if (sp.getBoolean("showFps", true) || !showPing) {
+                      frameActive = true; frames = 0; winStart = 0; fpsHist.clear()
+                      Choreographer.getInstance().removeFrameCallback(frameCb)
+                      Choreographer.getInstance().postFrameCallback(frameCb)
+                  }
+                  if (showPing) startPing()
+              }
+
+              private fun stopMeasure() {
+                  frameActive = false
+                  Choreographer.getInstance().removeFrameCallback(frameCb)
+                  pingGen++
+              }
+
+              private fun hz(): Int =
+                  ((getSystemService(DISPLAY_SERVICE) as DisplayManager).getDisplay(Display.DEFAULT_DISPLAY)?.refreshRate ?: 60f).toInt()
+
+              private val frameCb = object : Choreographer.FrameCallback {
+                  override fun doFrame(frameTimeNanos: Long) {
+                      if (!frameActive) return
+                      val now = frameTimeNanos / 1_000_000
+                      if (winStart == 0L) winStart = now
+                      frames++
+                      val el = now - winStart
+                      if (el >= 1000) {
+                          val fps = (frames * 1000f / el).toInt()
+                          frames = 0; winStart = now
+                          fpsHist.addLast(fps)
+                          if (fpsHist.size > 5) fpsHist.removeFirst()
+                          showFps(fps)
+                      }
+                      Choreographer.getInstance().postFrameCallback(this)
+                  }
+              }
+
+              private fun showFps(fps: Int) {
+                  val hz = hz()
+                  val ratio = fps.toFloat() / hz.coerceAtLeast(1)
+                  val c = when { ratio >= 0.9f -> cGreen; ratio >= 0.6f -> cYellow; else -> cRed }
+                  val extra = if (sp.getBoolean("detail", true)) "min ${fpsHist.minOrNull() ?: fps} • ${hz}Hz" else ""
+                  tvFps?.text = line("FPS", "$fps", c, extra)
+              }
+
+              private fun startPing() {
+                  results.clear()
+                  val gen = ++pingGen
+                  Thread {
+                      while (gen == pingGen) {
+                          val host = (sp.getString("host", "1.1.1.1") ?: "1.1.1.1").trim().ifBlank { "1.1.1.1" }
+                          val ms = pingOnce(host)
+                          h.post { if (gen == pingGen) onPing(ms) }
+                          val iv = sp.getInt("pingSec", 2).coerceIn(1, 30)
+                          try { Thread.sleep(iv * 1000L) } catch (_: InterruptedException) { return@Thread }
+                      }
+                  }.start()
+              }
+
+              private fun pingOnce(host: String): Double? {
+                  if (host.startsWith("-") || !host.matches(Regex("[A-Za-z0-9.:_-]+"))) return null
+                  try {
+                      val pr = ProcessBuilder("/system/bin/ping", "-c", "1", "-W", "2", "-w", "3", host)
+                          .redirectErrorStream(true).start()
+                      val out = pr.inputStream.bufferedReader().readText()
+                      pr.waitFor(4, TimeUnit.SECONDS)
+                      pr.destroy()
+                      val m = Regex("time[=<]([0-9.]+)\\s*ms").find(out)
+                      if (m != null) return m.groupValues[1].toDouble()
+                  } catch (_: Exception) {
+                  }
+                  return try {
+                      val addr = InetSocketAddress(host, 443)
+                      val t = SystemClock.elapsedRealtimeNanos()
+                      Socket().use { it.connect(addr, 2000) }
+                      (SystemClock.elapsedRealtimeNanos() - t) / 1_000_000.0
+                  } catch (_: Exception) {
+                      null
+                  }
+              }
+
+              private fun onPing(ms: Double?) {
+                  results.addLast(ms)
+                  if (results.size > 20) results.removeFirst()
+                  val ok = results.filterNotNull()
+                  val loss = results.count { it == null } * 100 / results.size
+                  val rec = ok.takeLast(10)
+                  val jit = if (rec.size >= 2) rec.zipWithNext { a, b -> abs(a - b) }.average() else 0.0
+                  val c = when {
+                      ms == null -> cRed
+                      ms < 50 -> cGreen
+                      ms < 100 -> cYellow
+                      ms < 150 -> cOrange
+                      else -> cRed
+                  }
+                  val value = if (ms == null) "yok" else "${ms.toInt()} ms"
+                  val extra = if (sp.getBoolean("detail", true)) "±${jit.toInt()} • %$loss kayıp" else ""
+                  tvPing?.text = line("PING", value, c, extra)
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/oyunhud
+          cat > app/src/main/java/com/oyunhud/MainActivity.kt <<'EOF'
+          package com.oyunhud
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private val cBg = 0xFF0F1115.toInt()
+              private val cCard = 0xFF1A1E27.toInt()
+              private val cField = 0xFF262B37.toInt()
+              private val cAccent = 0xFF4F8CFF.toInt()
+              private val cGreen = 0xFF22C55E.toInt()
+              private val cRed = 0xFFEF4444.toInt()
+              private val cMuted = 0xFF8D95A6.toInt()
+
+              private val sp by lazy { getSharedPreferences("hud", MODE_PRIVATE) }
+              private val numDefaults = linkedMapOf("pingSec" to 2, "textSize" to 13, "opacity" to 70)
+              private val switchDefaults = linkedMapOf("showFps" to true, "showPing" to true, "detail" to true, "locked" to false)
+              private val boxes = mutableMapOf<String, EditText>()
+              private val switches = linkedMapOf<String, Switch>()
+              private lateinit var hostEt: EditText
+              private lateinit var statusTv: TextView
+              private lateinit var hintTv: TextView
+              private lateinit var primary: Button
+              private lateinit var root: LinearLayout
+
+              private val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+              private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
+
+              private fun px(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun round(c: Int, r: Int) = GradientDrawable().apply { setColor(c); cornerRadius = px(r).toFloat() }
+              private fun txt(t: String, size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+                  text = t; textSize = size; setTextColor(color)
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+              }
+
+              private fun card(title: String): LinearLayout {
+                  val c = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      background = round(cCard, 16)
+                      setPadding(px(16), px(14), px(16), px(14))
+                  }
+                  c.addView(txt(title, 13f, cAccent, true))
+                  root.addView(c, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = px(12) })
+                  return c
+              }
+
+              private fun field(type: Int, widthDp: Int) = EditText(this).apply {
+                  inputType = type; isSingleLine = true
+                  setTextColor(Color.WHITE); setHintTextColor(cMuted); textSize = 15f
+                  gravity = Gravity.CENTER
+                  background = round(cField, 10)
+                  setPadding(px(8), 0, px(8), 0)
+                  layoutParams = LinearLayout.LayoutParams(px(widthDp), px(42))
+              }
+
+              private fun rowWith(card: LinearLayout, label: String, f: EditText) {
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                      setPadding(0, px(6), 0, px(6))
+                  }
+                  row.addView(txt(label, 14f, Color.WHITE).apply { layoutParams = LinearLayout.LayoutParams(0, WRAP, 1f) })
+                  row.addView(f)
+                  card.addView(row)
+              }
+
+              private fun numRow(card: LinearLayout, key: String, label: String) {
+                  val e = field(InputType.TYPE_CLASS_NUMBER, 90)
+                  boxes[key] = e
+                  rowWith(card, label, e)
+              }
+
+              private fun switchRow(card: LinearLayout, key: String, label: String, desc: String) {
+                  val s = Switch(this).apply { text = label; setTextColor(Color.WHITE); textSize = 14f }
+                  switches[key] = s
+                  card.addView(s, LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = px(10) })
+                  card.addView(txt(desc, 12f, cMuted))
+              }
+
+              private fun chip(label: String, host: String) = Button(this).apply {
+                  text = label; isAllCaps = false; textSize = 12f; setTextColor(Color.WHITE)
+                  background = round(cField, 10)
+                  layoutParams = LinearLayout.LayoutParams(0, px(40), 1f).apply { setMargins(px(3), px(3), px(3), px(3)) }
+                  setOnClickListener { hostEt.setText(host) }
+              }
+
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.statusBarColor = cBg
+                  window.navigationBarColor = cBg
+
+                  root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(px(16), px(40), px(16), px(32))
+                  }
+                  root.addView(txt("Oyun HUD", 28f, Color.WHITE, true))
+                  root.addView(txt("Her uygulamanın üstünde FPS ve ping", 14f, cMuted))
+
+                  val st = card("DURUM")
+                  statusTv = txt("", 16f, Color.WHITE, true)
+                  st.addView(statusTv)
+                  hintTv = txt("", 12f, cMuted)
+                  st.addView(hintTv)
+                  primary = Button(this).apply {
+                      isAllCaps = false; textSize = 15f; setTextColor(Color.WHITE)
+                      background = round(cAccent, 14)
+                  }
+                  st.addView(primary, LinearLayout.LayoutParams(MATCH, px(52)).apply { topMargin = px(12) })
+                  primary.setOnClickListener { onPrimary() }
+
+                  val c1 = card("GÖSTERGE")
+                  switchRow(c1, "showFps", "FPS göster", "Ekranın kare hızını ölçer. Oyunun iç FPS değeri Android'de normal uygulamalara kapalıdır, bu yüzden oyun ağırlaşınca düşer ama birebir aynı olmayabilir.")
+                  switchRow(c1, "showPing", "Ping göster", "Seçtiğin sunucuya internet gecikmesini ms olarak ölçer.")
+                  switchRow(c1, "detail", "Ayrıntılar", "Min FPS, ekran Hz, ping sapması (jitter) ve kayıp oranı.")
+                  switchRow(c1, "locked", "Konumu kilitle", "Açıksa HUD'a dokunmalar oyuna geçer. Taşımak için önce kapat.")
+
+                  val c2 = card("PING HEDEFİ")
+                  hostEt = field(InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI, 160).apply { hint = "1.1.1.1" }
+                  rowWith(c2, "Sunucu (IP / alan adı)", hostEt)
+                  val chips = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+                  chips.addView(chip("Cloudflare", "1.1.1.1"))
+                  chips.addView(chip("Google", "8.8.8.8"))
+                  chips.addView(chip("Quad9", "9.9.9.9"))
+                  c2.addView(chips)
+                  numRow(c2, "pingSec", "Ölçüm aralığı (sn)")
+                  c2.addView(txt("Oyunun kendi sunucu IP'sini yazarsan o sunucuya ping ölçülür. Boş bırakma.", 12f, cMuted))
+
+                  val c3 = card("GÖRÜNÜM")
+                  numRow(c3, "textSize", "Yazı boyutu")
+                  numRow(c3, "opacity", "Arka plan görünürlüğü %")
+
+                  setContentView(ScrollView(this).apply {
+                      setBackgroundColor(cBg); isFillViewport = true; addView(root)
+                  })
+                  loadValues()
+              }
+
+              private fun loadValues() {
+                  for ((k, def) in numDefaults) boxes[k]?.setText(sp.getInt(k, def).toString())
+                  hostEt.setText(sp.getString("host", "1.1.1.1"))
+                  for ((k, s) in switches) s.isChecked = sp.getBoolean(k, switchDefaults[k] ?: false)
+              }
+
+              private fun savePrefs() {
+                  val ed = sp.edit()
+                  for ((k, def) in numDefaults) ed.putInt(k, boxes[k]?.text?.toString()?.toIntOrNull() ?: def)
+                  ed.putString("host", hostEt.text.toString().trim())
+                  for ((k, s) in switches) ed.putBoolean(k, s.isChecked)
+                  ed.apply()
+              }
+
+              private fun onPrimary() {
+                  if (!Settings.canDrawOverlays(this)) {
+                      startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+                      return
+                  }
+                  if (HudService.running) {
+                      stopService(Intent(this, HudService::class.java))
+                  } else {
+                      if (Build.VERSION.SDK_INT >= 33 &&
+                          checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                      ) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                      savePrefs()
+                      startForegroundService(Intent(this, HudService::class.java))
+                      Toast.makeText(this, "HUD açıldı. Oyuna geçebilirsin.", Toast.LENGTH_SHORT).show()
+                  }
+                  primary.postDelayed({ refreshStatus() }, 500)
+              }
+
+              private fun refreshStatus() {
+                  val perm = Settings.canDrawOverlays(this)
+                  val on = HudService.running
+                  when {
+                      !perm -> {
+                          statusTv.text = "● İzin gerekli"; statusTv.setTextColor(cRed)
+                          hintTv.text = "Açılan listede Oyun HUD'ı bul ve izni aç."
+                          hintTv.visibility = View.VISIBLE
+                          primary.text = "İzin ver (üstte göster)"
+                      }
+                      on -> {
+                          statusTv.text = "● HUD açık"; statusTv.setTextColor(cGreen)
+                          hintTv.text = "HUD'ı sürükleyerek taşıyabilirsin. Bildirimden de durdurabilirsin."
+                          hintTv.visibility = View.VISIBLE
+                          primary.text = "HUD'ı durdur"
+                      }
+                      else -> {
+                          statusTv.text = "● HUD kapalı"; statusTv.setTextColor(cMuted)
+                          hintTv.visibility = View.GONE
+                          primary.text = "HUD'ı başlat"
+                      }
+                  }
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  loadValues()
+                  refreshStatus()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  savePrefs()
+              }
+          }
+          EOF
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Oyun HUD</string>
+          </resources>
+          EOF
+          mkdir -p .
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.2.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+          }
+          EOF
+          mkdir -p .
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2048m
+          android.useAndroidX=false
+          kotlin.code.style=official
+          EOF
+          mkdir -p .
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "OyunHUD"
+          include(":app")
+          EOF
+      - name: APK derle
+        run: gradle assembleDebug --no-daemon
+      - name: Release olarak yayinla
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk OyunHUD.apk
+          gh release create "v${{ github.run_number }}" OyunHUD.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "OyunHUD v${{ github.run_number }}" --notes "APK hazir"
